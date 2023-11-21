@@ -1,0 +1,6 @@
+tornado
+openai
+boto3
+requests
+django
+amazon-transcribe
