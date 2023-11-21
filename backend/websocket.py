@@ -79,7 +79,7 @@ def getOpenAiResponse(msgs):
         text = ''.join(collected_messages)
 
         if '.' in text or '?' in text or '!' in text:
-            # print(text)
+            print(text)
             collected_messages = []
             ai_sentences.append(text)
 
