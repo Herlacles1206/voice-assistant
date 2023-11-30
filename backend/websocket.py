@@ -22,37 +22,39 @@ from django.http import JsonResponse
 import json
 import asyncio
 
-from amazon_transcribe.client import TranscribeStreamingClient
-from amazon_transcribe.handlers import TranscriptResultStreamHandler
-from amazon_transcribe.model import TranscriptEvent
+import queue
+import re
+import sys
 
-import sounddevice
+from google.cloud import speech
+
+import pyaudio
 
 import time
 
 from dotenv import load_dotenv
 
+import queue
+
 load_dotenv()
 
-# Get AWS credentials from environment variables
-aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
-aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+# Audio recording parameters
+RATE = 16000
+CHUNK = int(RATE / 10)  # 100ms
 
 # Create your views here.
-ai_sentences = []
+ai_sentences = queue.Queue()
 openai_response_flag = False
 chunks = []
 mic_state = False
 aws_transcribe_flag = False
 user_sentences = ""
 
-polly_client = boto3.Session(
-                    aws_access_key_id=aws_access_key_id,
-                    aws_secret_access_key=aws_secret_access_key,
-                    region_name="eu-west-2"
-                ).client('polly')
+# Get AWS credentials from environment variables
+aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
+aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
 
-ai_client = OpenAI()
+language_code = "nl-NL"  # a BCP-47 language tag
 
 def getOpenAiResponse(msgs):
     print(msgs)
@@ -81,7 +83,7 @@ def getOpenAiResponse(msgs):
         if '.' in text or '?' in text or '!' in text:
             print(text)
             collected_messages = []
-            ai_sentences.append(text)
+            ai_sentences.put(text)
 
     openai_response_flag = True
 
@@ -100,77 +102,176 @@ def clearFolder(folder_path):
 
 
 
-class MyEventHandler(TranscriptResultStreamHandler):
-    async def handle_transcript_event(self, transcript_event: TranscriptEvent):
-        # This handler can be implemented to handle transcriptions as needed.
-        # Here's an example to get started.
-        global mic_state, user_sentences, aws_transcribe_flag
-        results = transcript_event.transcript.results
-        for result in results:
-            if not result.is_partial and aws_transcribe_flag:
-                for alt in result.alternatives:
-                    print("user: {}".format(alt.transcript))
-                    user_sentences =user_sentences + " " + alt.transcript
+class MicrophoneStream:
+    """Opens a recording stream as a generator yielding the audio chunks."""
 
-        for result in results:
-            if not result.is_partial:
-                if not mic_state:
-                    aws_transcribe_flag = False
+    def __init__(self: object, rate: int = RATE, chunk: int = CHUNK) -> None:
+        """The audio -- and generator -- is guaranteed to be on the main thread."""
+        self._rate = rate
+        self._chunk = chunk
+
+        # Create a thread-safe buffer of audio data
+        self._buff = queue.Queue()
+        self.closed = True
+
+    def __enter__(self: object) -> object:
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            # The API currently only supports 1-channel (mono) audio
+            # https://goo.gl/z757pE
+            channels=1,
+            rate=self._rate,
+            input=True,
+            frames_per_buffer=self._chunk,
+            # Run the audio stream asynchronously to fill the buffer object.
+            # This is necessary so that the input device's buffer doesn't
+            # overflow while the calling thread makes network requests, etc.
+            stream_callback=self._fill_buffer,
+        )
+
+        self.closed = False
+
+        return self
+
+    def __exit__(
+        self: object,
+        type: object,
+        value: object,
+        traceback: object,
+    ) -> None:
+        """Closes the stream, regardless of whether the connection was lost or not."""
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
+        self.closed = True
+        # Signal the generator to terminate so that the client's
+        # streaming_recognize method will not block the process termination.
+        self._buff.put(None)
+        self._audio_interface.terminate()
+
+    def _fill_buffer(
+        self: object,
+        in_data: object,
+        frame_count: int,
+        time_info: object,
+        status_flags: object,
+    ) -> object:
+        """Continuously collect data from the audio stream, into the buffer.
+
+        Args:
+            in_data: The audio data as a bytes object
+            frame_count: The number of frames captured
+            time_info: The time information
+            status_flags: The status flags
+
+        Returns:
+            The audio data as a bytes object
+        """
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
+
+    def generator(self: object) -> object:
+        """Generates audio chunks from the stream of audio data in chunks.
+
+        Args:
+            self: The MicrophoneStream object
+
+        Returns:
+            A generator that outputs audio chunks.
+        """
+        while not self.closed:
+            # Use a blocking get() to ensure there's at least one chunk of
+            # data, and stop iteration if the chunk is None, indicating the
+            # end of the audio stream.
+            chunk = self._buff.get()
+            if chunk is None:
+                return
+            data = [chunk]
+
+            # Now consume whatever other data's still buffered.
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
                     break
-                
+
+            yield b"".join(data)
 
 
-       
+def listen_print_loop(responses: object) -> str:
+    """Iterates through server responses and prints them.
 
-async def mic_stream():
-    # This function wraps the raw input stream from the microphone forwarding
-    # the blocks to an asyncio.Queue.
-    loop = asyncio.get_event_loop()
-    input_queue = asyncio.Queue()
+    The responses passed is a generator that will block until a response
+    is provided by the server.
 
-    def callback(indata, frame_count, time_info, status):
-        loop.call_soon_threadsafe(input_queue.put_nowait, (bytes(indata), status))
+    Each response may contain multiple results, and each result may contain
+    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
+    print only the transcription for the top alternative of the top result.
 
-    # Be sure to use the correct parameters for the audio stream that matches
-    # the audio formats described for the source language you'll be using:
-    # https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html
-    stream = sounddevice.RawInputStream(
-        channels=1,
-        samplerate=16000,
-        callback=callback,
-        blocksize=1024 * 2,
-        dtype="int16",
-    )
-    # Initiate the audio stream and asynchronously yield the audio chunks
-    # as they become available.
-    with stream:
-        while True:
-            indata, status = await input_queue.get()
-            yield indata, status
+    In this case, responses are provided for interim results as well. If the
+    response is an interim one, print a line feed at the end of it, to allow
+    the next result to overwrite it, until the response is a final one. For the
+    final one, print a newline to preserve the finalized transcription.
 
-async def write_chunks(stream):
-    # This connects the raw audio chunks generator coming from the microphone
-    # and passes them along to the transcription stream.
-    async for chunk, status in mic_stream():
-        await stream.input_stream.send_audio_event(audio_chunk=chunk)
-    await stream.input_stream.end_stream()
+    Args:
+        responses: List of server responses
 
+    Returns:
+        The transcribed text.
+    """
+    global user_sentences, aws_transcribe_flag, mic_state
+    num_chars_printed = 0
 
-async def basic_transcribe():
-    print('-------------basic_transcribe()----------------')
-    # Setup up our client with our chosen AWS region
-    client = TranscribeStreamingClient(region="eu-west-2")
+    for response in responses:
+        if not response.results:
+            continue
 
-    # Start transcription to generate our async stream
-    stream = await client.start_stream_transcription(
-        language_code="en-US",
-        media_sample_rate_hz=16000,
-        media_encoding="pcm",
-    )
+        # The `results` list is consecutive. For streaming, we only care about
+        # the first result being considered, since once it's `is_final`, it
+        # moves on to considering the next utterance.
+        result = response.results[0]
+        if not result.alternatives:
+            continue
 
-    # Instantiate our handler and start processing events
-    handler = MyEventHandler(stream.output_stream)
-    await asyncio.gather(write_chunks(stream), handler.handle_events())
+        # Display the transcription of the top alternative.
+        transcript = result.alternatives[0].transcript
+        
+        num_chars_printed = len(transcript)
+
+        # Display interim results, but with a carriage return at the end of the
+        # line, so subsequent lines will overwrite them.
+        #
+        # If the previous result was longer than this one, we need to print
+        # some extra spaces to overwrite the previous result
+        overwrite_chars = " " * (num_chars_printed - len(transcript))
+
+        if not result.is_final:
+            # sys.stdout.write(transcript + overwrite_chars + "\r")
+            # sys.stdout.flush()
+
+            num_chars_printed = len(transcript)
+
+        else:
+            # print(transcript + overwrite_chars)
+            if aws_transcribe_flag:
+                print("user: {}".format(transcript))
+                user_sentences = user_sentences + " " + transcript
+            if not mic_state:
+                aws_transcribe_flag = False
+            # Exit recognition if any of the transcribed phrases could be
+            # one of our keywords.
+            if re.search(r"\b(exit|quit)\b", transcript, re.I):
+                print("Exiting..")
+                break
+
+            num_chars_printed = 0
+
+    # return "".join(transcripts)
+    return
+
 
 
 class CorsWebSocketHandler(tornado.websocket.WebSocketHandler):
@@ -223,7 +324,8 @@ class EchoWebSocket(CorsWebSocketHandler):
         elif message == 'End':
             mic_state = False
             
-
+            if not mic_state:
+                aws_transcribe_flag = False
             while True:
                 if not aws_transcribe_flag:
                     if user_sentences:
@@ -265,15 +367,23 @@ class EchoWebSocket(CorsWebSocketHandler):
         self.finish()
 
     def getAssistantContent(self, data):
-        global ai_sentences, openai_response_flag
-        msgs = [{"role": "system", "content": "You are a helpful assistant."}]
+        global ai_sentences, openai_response_flag, language_code
+
+        system_content = "You are a helpful assistant."
+        if language_code == 'nl-NL':
+            system_content = '''You are a translator and helpful assistant. You always receive Dutch messages. For all messages users submit to you you must, 
+            1. Generate a literal translation of input text into into English.
+            2. Response properly in Dutch.
+            '''
+        
+        msgs = [{"role": "system", "content": system_content}]
 
 
         msgs.append({"role": "user", "content": data})
         # print(msgs)
 
         openai_response_flag = False
-        ai_sentences = []
+        ai_sentences.queue.clear()
         thread = threading.Thread(target=getOpenAiResponse, args=(msgs,))
         thread.start()
 
@@ -284,25 +394,26 @@ class EchoWebSocket(CorsWebSocketHandler):
         ready = True
         sentence_cnt = 0
         while True:
-            if not ai_sentences and openai_response_flag:
+            if ai_sentences.empty() and openai_response_flag:
                 break
-            if ai_sentences and ready:
+            if not ai_sentences.empty() and ready:
                 # print('text to speech process')
                 ready = False
-                sentence = ai_sentences.pop(0)
+                sentence = ai_sentences.get()
 
                 # for test
                 print('Ai: {}'.format(sentence))
 
                 # open("audio/{}.mp3".format(sentence_cnt), "a").close()
-
+                st_time = time.time()
                 audio = polly_client.synthesize_speech(
                         Text=sentence,
                         VoiceId='Joanna',
                         Engine='neural',
-                        LanguageCode='en-US',
+                        LanguageCode=language_code,
                         OutputFormat="mp3"
                     )
+                # print('text-to-speech elasped: {}'.format(round(time.time() - st_time), 2))
 
                 # print("audio type: ", audio)
                 # Get the content of the generated audio file
@@ -319,6 +430,7 @@ class EchoWebSocket(CorsWebSocketHandler):
                 json_data = json.dumps(audioTextResponse)
                 self.write_message(json_data)
 
+                
                 sentence_cnt += 1
                 ready = True
             else:
@@ -341,18 +453,55 @@ application = tornado.web.Application([
     (r'/cors', CorsHandler),
 ])
 
-def run_transcribe_task():
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(basic_transcribe())
-    loop.close()
+def basic_transcribe(streaming_config):
+    print('-------------basic_transcribe()----------------')
+    """Transcribe speech from audio file."""
+    # See http://g.co/cloud/speech/docs/languages
+    # for a list of supported languages.
+    
+
+    client = speech.SpeechClient()
+    
+    with MicrophoneStream(RATE, CHUNK) as stream:
+        audio_generator = stream.generator()
+        requests = (
+            speech.StreamingRecognizeRequest(audio_content=content)
+            for content in audio_generator
+        )
+
+        responses = client.streaming_recognize(streaming_config, requests)
+
+        # Now, put the transcription responses to use.
+        listen_print_loop(responses)
 
 
 if __name__ == '__main__':
     chunks = []
     mic_state = False
 
-    thread = threading.Thread(target=run_transcribe_task)
+    print('loading...')
+    polly_client = boto3.Session(
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key,
+                    region_name="eu-west-2"
+                ).client('polly')
+
+    print('amazon polly loaded')
+    ai_client = OpenAI()
+    print('chatgpt loaded')
+
+    
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=RATE,
+        language_code=language_code,
+    )
+
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=config, interim_results=True
+    )
+
+    thread = threading.Thread(target=basic_transcribe, args=(streaming_config,))
     thread.start()
     application.listen(8000)
 
