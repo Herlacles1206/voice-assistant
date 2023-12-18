@@ -54,7 +54,7 @@ user_sentences = ""
 aws_access_key_id = os.environ["AWS_ACCESS_KEY_ID"]
 aws_secret_access_key = os.environ["AWS_SECRET_ACCESS_KEY"]
 
-language_code = "nl-NL"  # a BCP-47 language tag
+language_code = "en-US"  # a BCP-47 language tag
 
 def getOpenAiResponse(msgs):
     print(msgs)
